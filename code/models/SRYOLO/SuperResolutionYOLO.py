@@ -60,7 +60,7 @@ class SRYOLO(nn.Module):
         self,
         yolo_weights: str,
         scale: int,
-        model_path: str,
+        gan_weights: str,
         dni_weight: float,
         tile: int,
         tile_pad: int,
@@ -75,7 +75,7 @@ class SRYOLO(nn.Module):
         arch = SRVGGNetCompact(3,3,64,32,scale,'prelu')
         upsampler = RealESRGANer(
             scale=scale,
-            model_path=model_path,
+            model_path=gan_weights,
             dni_weight=dni_weight,
             model=arch,
             tile=tile,
@@ -91,7 +91,7 @@ class SRYOLO(nn.Module):
             # Se stai usando un modello base tipo yolov9c.pt, allora aggiungi SRWrapper
             stride = int(self.yolo.model.stride.max())
             self.yolo.model.model = nn.Sequential(
-                SRWrapper(self.upsampler, self.max_size, stride),
+                SRWrapper(upsampler, self.max_size, stride),
                 *list(self.yolo.model.model.children())
             )
         # Altrimenti, `best.pt` si assume già abbia SRWrapper incluso nel backbone
@@ -176,16 +176,16 @@ if __name__ == '__main__':
         pre_pad=0,
         max_size=1280
     )
-    sr_yolo.train(
-        data=os.path.join(dataset_path, 'data.yaml'),
-        epochs=50,
-        imgsz=1280,
-        save=True,
-        project="yolo_football_analysis",
-        name="yoloSR_dataset_v3_high_res",
-        batch=4
-    )
-    sr_yolo.val(data=os.path.join(dataset_path, 'data.yaml'), imgsz=1280)
-    preds = sr_yolo.predict(source='dataset/images', imgsz=1280)
-    for r in preds:
-        print(r.orig_img.shape, len(r.boxes))
+    # sr_yolo.train(
+    #     data=os.path.join(dataset_path, 'data.yaml'),
+    #     epochs=50,
+    #     imgsz=1280,
+    #     save=True,
+    #     project="yolo_football_analysis",
+    #     name="yoloSR_dataset_v3_high_res",
+    #     batch=4
+    # )
+    # sr_yolo.val(data=os.path.join(dataset_path, 'data.yaml'), imgsz=1280)
+    # preds = sr_yolo.predict(source='dataset/images', imgsz=1280)
+    # for r in preds:
+    #     print(r.orig_img.shape, len(r.boxes))

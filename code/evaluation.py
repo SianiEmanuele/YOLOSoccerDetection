@@ -48,17 +48,17 @@ def detect_images(images_path, model_path, output_path, model_name):
     test_path = images_path
     tracker = Tracker(model_path=model_path)
 
-    predictions = YOLO(model_path).predict(test_path)
-    # predictions = SRYOLO(
-    #     yolo_weights=model_path,
-    #     scale=4,
-    #     model_path=r'src\models\esrgan\experiments\finetune_Realesr-general-x4v3_2\models\net_g_latest.pth',
-    #     dni_weight=0.5,
-    #     tile=0,
-    #     tile_pad=10,
-    #     pre_pad=0,
-    #     max_size=1280
-    # ).predict(source=test_path)
+    # predictions = YOLO(model_path).predict(test_path)
+    predictions = SRYOLO(
+        yolo_weights=model_path,
+        scale=4,
+        model_path=r'src\models\esrgan\experiments\finetune_Realesr-general-x4v3_2\models\net_g_latest.pth',
+        dni_weight=0.5,
+        tile=0,
+        tile_pad=10,
+        pre_pad=0,
+        max_size=1280
+    ).predict(source=test_path)
     drawn_images, test_images = annotate_predictions(predictions, tracker)
     
     # Save the drawn images into a folder
