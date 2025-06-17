@@ -95,7 +95,7 @@ class SRYOLO(YOLO):
     def __init__(self, yolo_weights, upscale=4, gan_weights=None, dni_weight=0.5,
                  tile=0, tile_pad=10, pre_pad=0):
 
-        super().__init__(yolo_weights)
+        super().__init__(model=yolo_weights)
         self.yolo_weights_path = yolo_weights
         self._sr_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Device for Super-Resolution: {self._sr_device}")
