@@ -1,191 +1,305 @@
-import os
 import cv2
-import torch
-import numpy as np
-from torch import nn
-from realesrgan.archs.srvgg_arch import SRVGGNetCompact
-from realesrgan import RealESRGANer
-from ultralytics import YOLO
 import gc
-from pathlib import Path
+import torch
+import os
+import yaml
+import glob
+from tqdm import tqdm
 
-class SRWrapper(nn.Module):
+# Environment settings and imports
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+from ultralytics.models.yolo import YOLO
+from torch.utils.data import Dataset, DataLoader
+from basicsr.archs.srvgg_arch import SRVGGNetCompact
+from realesrgan import RealESRGANer
+
+
+# ==============================================================================
+# 1. DATASET CLASS WITH CACHING LOGIC
+# ==============================================================================
+class CachedSRYOLODataset(Dataset):
     """
-    Applicazione on-the-fly di Real-ESRGAN come primo layer.
+    A Dataset that creates a cache of pre-processed images with Super-Resolution.
+    Performs SR only once and then loads data from cache for fast training.
     """
-    def __init__(self, upsampler: RealESRGANer, max_size: int, stride: int):
+
+    def __init__(self, img_dir, label_dir, sryolo_instance, cache_dir_name="cache", force_recache=False):
         super().__init__()
-        self.upsampler = upsampler
-        self.max_size = max_size
-        self.stride = stride
 
-        # ultralytics compatibility for prediction
-        self.f = -1 # avoid warning about unused variable
-        self.i = 0
+        # The SRYOLO instance is needed to use its SR method
+        self.sryolo_instance = sryolo_instance
 
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: BxCxHxW, valori in [0,1]
-        b, c, h0, w0 = x.shape
-        out = []
-        for i in range(b):
-            img = (x[i].cpu().permute(1,2,0).numpy() * 255).astype('uint8')
-            try:
-                sr, _ = self.upsampler.enhance(img, outscale=1)
-            except RuntimeError as e:
-                print(f"OOM during SR: {e}")
-                torch.cuda.empty_cache()
-                sr = img
-            torch.cuda.empty_cache()
-            # resize
-            h, w = sr.shape[:2]
-            scale_ratio = self.max_size / max(h, w)
-            new_h, new_w = int(h*scale_ratio), int(w*scale_ratio)
-            sr = cv2.resize(sr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            # pad
-            ph, pw = (-new_h) % self.stride, (-new_w) % self.stride
-            top, bottom = ph//2, ph-ph//2
-            left, right = pw//2, pw-pw//2
-            sr = np.pad(sr, ((top,bottom),(left,right),(0,0)), constant_values=114)
-            tensor_sr = torch.from_numpy(sr).permute(2,0,1).float()/255.0
-            out.append(tensor_sr.to(x.device))
-        return torch.stack(out)
+        # Build paths for cache
+        # Cache is created relative to the dataset folder
+        base_dir = os.path.dirname(img_dir)
+        self.cache_dir = os.path.join(base_dir, cache_dir_name)
+        self.cached_img_dir = os.path.join(self.cache_dir, "images")
+        self.cached_label_dir = os.path.join(self.cache_dir, "labels")
 
-class SRYOLO(nn.Module):
-    """
-    Integrazione di Real-ESRGAN nel modello YOLOv9c.
-    SR viene applicata on-the-fly durante train, val e predict.
-    """
-    def __init__(
-        self,
-        yolo_weights: str,
-        scale: int,
-        gan_weights: str,
-        dni_weight: float,
-        tile: int,
-        tile_pad: int,
-        pre_pad: int,
-        max_size: int = 640,
-        device: str = 'cuda:0'
-    ):
-        super().__init__()
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.max_size = max_size
-        # Init SR upsampler
-        arch = SRVGGNetCompact(3,3,64,32,scale,'prelu')
-        upsampler = RealESRGANer(
-            scale=scale,
-            model_path=gan_weights,
-            dni_weight=dni_weight,
-            model=arch,
-            tile=tile,
-            tile_pad=tile_pad,
-            pre_pad=pre_pad,
-            half=True,
-            gpu_id=0 if 'cuda' in device else -1
-        )
-        # Init YOLO
-        self.yolo = YOLO(yolo_weights)
+        self.image_paths = sorted(glob.glob(os.path.join(img_dir, '*.jpg')))  # or other formats
+        self.label_paths = sorted(glob.glob(os.path.join(label_dir, '*.txt')))
 
-        if not self.is_trained_model(yolo_weights):
-            # Se stai usando un modello base tipo yolov9c.pt, allora aggiungi SRWrapper
-            stride = int(self.yolo.model.stride.max())
-            self.yolo.model.model = nn.Sequential(
-                SRWrapper(upsampler, self.max_size, stride),
-                *list(self.yolo.model.model.children())
+        # Check if cache exists and needs to be created
+        num_cached_imgs = len(glob.glob(os.path.join(self.cached_img_dir, '*.pt')))
+        if force_recache or num_cached_imgs != len(self.image_paths):
+            print(f"Cache not found or incomplete. Creating cache in: {self.cache_dir}")
+            self.create_cache(img_dir, label_dir)
+        else:
+            print(f"Valid cache found. Loading from: {self.cache_dir}")
+
+        # Now, point to files in cache
+        self.cached_image_files = sorted(glob.glob(os.path.join(self.cached_img_dir, '*.pt')))
+        self.cached_label_files = sorted(glob.glob(os.path.join(self.cached_label_dir, '*.txt')))
+
+    def create_cache(self, img_dir, label_dir):
+        os.makedirs(self.cached_img_dir, exist_ok=True)
+        os.makedirs(self.cached_label_dir, exist_ok=True)
+
+        print("Applying Super-Resolution to create cache. This may take time...")
+        for img_path in tqdm(self.image_paths, desc="Caching Images"):
+            base_filename = os.path.splitext(os.path.basename(img_path))[0]
+
+            # Load image as NumPy array, as your method does
+            img_np = cv2.imread(img_path)
+            img_np_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+
+            sr_np_rgb = self.sryolo_instance.apply_sr_np(img_np_rgb)
+
+            # Save visible image for verification
+            cv2.imwrite(os.path.join(self.cached_img_dir, f"{base_filename}.png"),
+                        cv2.cvtColor(sr_np_rgb, cv2.COLOR_RGB2BGR))
+
+            # Convert to tensor and save for training
+            sr_tensor = torch.from_numpy(sr_np_rgb.transpose(2, 0, 1)).float() / 255.0
+            torch.save(sr_tensor, os.path.join(self.cached_img_dir, f"{base_filename}.pt"))
+
+            # Copy corresponding label file
+            label_path = os.path.join(label_dir, f"{base_filename}.txt")
+            if os.path.exists(label_path):
+                import shutil
+                shutil.copy(label_path, self.cached_label_dir)
+
+    def __len__(self):
+        return len(self.cached_image_files)
+
+    def __getitem__(self, index):
+        # Load tensor and labels from cache
+        img_tensor = torch.load(self.cached_image_files[index])
+        pass  # Actual logic is handled in SRYOLO train method
+
+
+# ==============================================================================
+# 2. MODIFIED SRYOLO CLASS
+# ==============================================================================
+class SRYOLO(YOLO):
+    def __init__(self, yolo_weights, upscale=4, gan_weights=None, dni_weight=0.5,
+                 tile=0, tile_pad=10, pre_pad=0):
+
+        super().__init__(yolo_weights)
+        self.yolo_weights_path = yolo_weights
+        self._sr_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Device for Super-Resolution: {self._sr_device}")
+
+        if gan_weights:
+            arch = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=upscale,
+                                   act_type='prelu')
+            self.sr_model = RealESRGANer(
+                scale=upscale, model_path=gan_weights, dni_weight=dni_weight, model=arch,
+                tile=tile, tile_pad=tile_pad, pre_pad=pre_pad, half=True,
+                gpu_id=0 if 'cuda' in str(self._sr_device) else -1
             )
-        # Altrimenti, `best.pt` si assume già abbia SRWrapper incluso nel backbone
+            print("Super-Resolution model loaded successfully. 👍")
+        else:
+            self.sr_model = None
+            print("No GAN weights provided, Super-Resolution is disabled.")
 
-        self.yolo.model.to(self.device)
+    def apply_sr_np(self, img_np_rgb):
+        if not self.sr_model:
+            return img_np_rgb
+        original_height, original_width = img_np_rgb.shape[:2]
+        original_dims = (original_width, original_height)
+        try:
+            with torch.no_grad():
+                enhanced_output, _ = self.sr_model.enhance(img_np_rgb, outscale=self.sr_model.scale)
+            resized_output = cv2.resize(enhanced_output, original_dims, interpolation=cv2.INTER_AREA)
+            del enhanced_output
+            gc.collect()
+            torch.cuda.empty_cache()
+            return resized_output
+        except Exception as e:
+            print(f"[SR ERROR] Error during Super-Resolution application: {e}")
+            return img_np_rgb
 
-    def is_trained_model(self, path: str) -> bool:
-        return Path(path).name in ['best.pt', 'last.pt']
+    def _create_dataset_cache(self, img_path, label_path, cache_name):
+        """Helper to create cache for a given split (train/val)."""
+        print(f"\n--- Checking cache for split in {img_path} ---")
+        cache_img_path = os.path.join(os.path.dirname(img_path), cache_name, "images")
+
+        num_orig_imgs = len(glob.glob(os.path.join(img_path, '*')))
+        num_cached_imgs = len(glob.glob(os.path.join(cache_img_path, '*.png')))
+
+        if num_cached_imgs == num_orig_imgs:
+            print("Cache found and complete. Training will use images from cache.")
+            return
+
+        print("Cache not found or incomplete. Starting creation...")
+        os.makedirs(cache_img_path, exist_ok=True)
+        cache_label_path = os.path.join(os.path.dirname(label_path), cache_name, "labels")
+        os.makedirs(cache_label_path, exist_ok=True)
+
+        original_image_files = sorted(glob.glob(os.path.join(img_path, '*')))
+        for img_file in tqdm(original_image_files, desc=f"Caching {cache_name}"):
+            base_filename = os.path.splitext(os.path.basename(img_file))[0]
+
+            img_np = cv2.imread(img_file)
+            img_np_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+
+            sr_np_rgb = self.apply_sr_np(img_np_rgb)
+
+            # Save processed image
+            cv2.imwrite(os.path.join(cache_img_path, f"{base_filename}.png"),
+                        cv2.cvtColor(sr_np_rgb, cv2.COLOR_RGB2BGR))
+
+            # Copy label file
+            orig_label_file = os.path.join(label_path, f"{base_filename}.txt")
+            if os.path.exists(orig_label_file):
+                import shutil
+                shutil.copy(orig_label_file, cache_label_path)
 
     def train(self, **kwargs):
-        """Chiamata identica a YOLO.train, con SR on-the-fly integrata."""
-        return self.yolo.train(**kwargs)
-
-    def val(self, **kwargs):
-        return self.yolo.val(**kwargs)
-
-    def predict(self, source, **kwargs):
         """
-        Predict con SR integrata e gestione memoria ottimizzata
+        Performs training after creating (if necessary) a pre-processed dataset
+        in a clean cache folder, with robust file search.
         """
-        # Imposta dimensione immagine se non specificata
-        if 'imgsz' not in kwargs:
-            kwargs['imgsz'] = self.max_size
+        # 1. Read data.yaml file to get paths
+        data_yaml_path = kwargs['data']
+        with open(data_yaml_path, 'r') as f:
+            data_config = yaml.safe_load(f)
 
-        # Riduci batch size per evitare OOM durante predict
-        original_batch = kwargs.get('batch', None)
-        if original_batch is None or original_batch > 4:
-            kwargs['batch'] = 2
+        # Base path of dataset, relative to .yaml file
+        base_path = os.path.abspath(os.path.dirname(data_yaml_path))
 
-        try:
-            # Pulizia memoria prima della predict
-            torch.cuda.empty_cache()
+        cached_data_config = data_config.copy()
+        splits_to_cache = {'train', 'val'}
+
+        for split in splits_to_cache:
+            if split not in data_config:
+                continue
+
+            # fixed discrepancy in 'val' split name
+            if split == 'val':
+                split = 'valid'
+
+            original_img_dir = os.path.join(base_path, split, 'images')
+            cache_dir = os.path.join(base_path, f"cache_{split}")
+            cached_img_dir = os.path.join(cache_dir, "images")
+            cached_label_dir = os.path.join(cache_dir, "labels")
+
+            print(f"\n--- Checking cache for split '{split}' ---")
+
+            # DEBUG print to verify path
+            print(f"Looking for original images in: {original_img_dir}")
+
+            image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp']
+            original_image_files = []
+            for ext in image_extensions:
+                original_image_files.extend(glob.glob(os.path.join(original_img_dir, ext)))
+
+            # Remove any duplicates and sort
+            original_image_files = sorted(list(set(original_image_files)))
+            num_orig_imgs = len(original_image_files)
+
+            # Another DEBUG print
+            print(f"Found {num_orig_imgs} original image files.")
+
+            if num_orig_imgs == 0:
+                print(
+                    "WARNING: No image files found. Check that the path printed above is correct and contains images with valid extensions.")
+                continue  # Move to next split (e.g. 'val')
+
+            num_cached_imgs = len(glob.glob(os.path.join(cached_img_dir, '*.png')))
+
+            if num_cached_imgs != num_orig_imgs:
+                print(f"Cache for '{split}' not found or incomplete. Creating...")
+                os.makedirs(cached_img_dir, exist_ok=True)
+                os.makedirs(cached_label_dir, exist_ok=True)
+
+                original_label_dir = original_img_dir.replace('images', 'labels')
+
+                for img_file in tqdm(original_image_files, desc=f"Caching {split}"):
+                    base_filename = os.path.splitext(os.path.basename(img_file))[0]
+
+                    img_np = cv2.imread(img_file)
+                    img_np_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+
+                    sr_np_rgb = self.apply_sr_np(img_np_rgb)
+
+                    cv2.imwrite(os.path.join(cached_img_dir, f"{base_filename}.png"),
+                                cv2.cvtColor(sr_np_rgb, cv2.COLOR_RGB2BGR))
+
+                    orig_label_file = os.path.join(original_label_dir, f"{base_filename}.txt")
+                    if os.path.exists(orig_label_file):
+                        import shutil
+                        shutil.copy(orig_label_file, cached_label_dir)
+            else:
+                print(f"Cache for '{split}' found and complete.")
+
+            # fixed discrepancy in 'val' split name
+            if split == 'valid':
+                split = 'val'
+
+            cached_data_config[split] = os.path.relpath(cached_img_dir, base_path).replace('\\', '/')
+
+        # 3. Create new data.yaml file pointing to cache
+        cached_yaml_path = os.path.join(base_path, 'cached_data.yaml')
+        with open(cached_yaml_path, 'w') as f:
+            yaml.dump(cached_data_config, f)
+
+        print(f"\nTraining started using cached dataset specified in: {cached_yaml_path}")
+
+        if self.sr_model:
+            del self.sr_model
+            self.sr_model = None
             gc.collect()
-
-            # Esegui predict
-            results = self.yolo.predict(source, **kwargs)
-
-            # Filtro dei risultati: rimuovi quelli con immagini non valide
-            valid_results = []
-            for r in results:
-                if r.orig_img is not None and isinstance(r.orig_img, np.ndarray):
-                    valid_results.append(r)
-                else:
-                    print(f"Warning: Result with None image skipped.")
-
-            return valid_results
-
-        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-            print(f"OOM durante predict, riprovo con batch=1: {e}")
             torch.cuda.empty_cache()
-            gc.collect()
+            print("\nSR model released from memory. Starting YOLO training.")
 
-            kwargs['batch'] = 1
-            results = self.yolo.predict(source, **kwargs)
+        kwargs['data'] = cached_yaml_path
+        super().train(**kwargs)
 
-            valid_results = []
-            for r in results:
-                if r.orig_img is not None and isinstance(r.orig_img, np.ndarray):
-                    valid_results.append(r)
-                else:
-                    print(f"Warning: Result with None image skipped.")
-
-            return valid_results
-
-        finally:
-            torch.cuda.empty_cache()
-            gc.collect()
+    def predict(self, source=None, **kwargs):
+        return super().predict(source=source, **kwargs)
 
 
-
-# Esempio
+# ==============================================================================
+# 3. USAGE EXAMPLE
+# ==============================================================================
 if __name__ == '__main__':
-    import os
-    dataset_path = r'dataset\yolov9\v3'
+    cwd = os.getcwd()
+    gan_weights = os.path.join(cwd, "..", "esrgan", "pretrained", "realesr-general-x4v3.pth")
+
+    # Create SRYOLO model with on-the-fly SR
     sr_yolo = SRYOLO(
-        yolo_weights='yolov9c.pt',
-        scale=4,
-        model_path=r'src\models\esrgan\experiments\finetune_Realesr-general-x4v3_2\models\net_g_latest.pth',
+        yolo_weights="yolov9c.pt",
+        upscale=4,
+        gan_weights=gan_weights,
         dni_weight=0.5,
         tile=0,
         tile_pad=10,
         pre_pad=0,
-        max_size=1280
     )
-    # sr_yolo.train(
-    #     data=os.path.join(dataset_path, 'data.yaml'),
-    #     epochs=50,
-    #     imgsz=1280,
-    #     save=True,
-    #     project="yolo_football_analysis",
-    #     name="yoloSR_dataset_v3_high_res",
-    #     batch=4
-    # )
-    # sr_yolo.val(data=os.path.join(dataset_path, 'data.yaml'), imgsz=1280)
-    # preds = sr_yolo.predict(source='dataset/images', imgsz=1280)
-    # for r in preds:
-    #     print(r.orig_img.shape, len(r.boxes))
+    sr_yolo = sr_yolo.cuda()
+
+    # Training with on-the-fly SR
+    dataset_path = os.path.join(cwd, "..", "..", "..", "dataset", "yolov9", "v0")
+
+    # Method 1: Direct training (recommended)
+    sr_yolo.train(
+        data=os.path.join(dataset_path, "data.yaml"),
+        epochs=50,
+        imgsz=1280,
+        save=True,
+        project="yolo_football_analysis",
+        name="yoloSR_dataset_v3_high_res_onthefly",
+        batch=4
+    )
