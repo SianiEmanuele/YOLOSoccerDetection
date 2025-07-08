@@ -5,6 +5,7 @@ import os
 import cv2
 from ultralytics import YOLO
 from models import SRYOLO
+import matplotlib.pyplot as plt
 
 def annotate_predictions(predictions, tracker):
         drawn_images = []
@@ -44,36 +45,40 @@ def detect_video(video_path, model_path, output_path):
     output_video_frames = tracker.draw_annotations(video_frames, tracks)
     save_video(output_video_frames, output_path)
 
-def detect_images(images_path, model_path, output_path, model_name):
+
+def detect_images(images_path, model_path, is_sr=False, gan_weights=None):
     test_path = images_path
     tracker = Tracker(model_path=model_path)
-
-    # predictions = YOLO(model_path).predict(test_path)
-    predictions = SRYOLO(
-        yolo_weights=model_path,
-        scale=4,
-        model_path=r'src\models\esrgan\experiments\finetune_Realesr-general-x4v3_2\models\net_g_latest.pth',
-        dni_weight=0.5,
-        tile=0,
-        tile_pad=10,
-        pre_pad=0,
-        max_size=1280
-    ).predict(source=test_path)
+    if not is_sr:
+        predictions = YOLO(model_path).predict(test_path)
+    else:
+        predictions = SRYOLO(
+            yolo_weights=model_path,
+            upscale=4,
+            gan_weights=gan_weights,
+            dni_weight=0.5,
+            tile=0,
+            tile_pad=10
+        ).predict(source=test_path)
     drawn_images, test_images = annotate_predictions(predictions, tracker)
     
-    # Save the drawn images into a folder
-    output_folder = os.path.join(output_path, model_name)
-    os.makedirs(output_folder, exist_ok=True)
-    os.makedirs(os.path.join(output_folder, "predicted"), exist_ok=True)
-    os.makedirs(os.path.join(output_folder, "input"), exist_ok=True)
+    n_images = len(drawn_images)
+    
+    # Create figure with height proportional to number of images, width fixed
+    plt.figure(figsize=(8, 6 * n_images))  # width=8, height=6 per image
+    
+    for i, img in enumerate(drawn_images):
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Arrange subplots in a single column
+        plt.subplot(n_images, 1, i + 1)
+        plt.imshow(img_rgb)
+        plt.axis('off')
+        plt.title(f"Image {i}")
+    
+    plt.tight_layout()
+    plt.show()
 
-    for i, (test_image, drawn_image) in enumerate(zip(test_images, drawn_images)):
-        # Save the drawn image
-        output_path = os.path.join(output_folder, "predicted", f"predicted_{i}.jpg")
-        cv2.imwrite(output_path, drawn_image)
-        # Save the original image
-        input_path = os.path.join(output_folder, "input", f"input_{i}.jpg")
-        cv2.imwrite(input_path, test_image)
 
     
 

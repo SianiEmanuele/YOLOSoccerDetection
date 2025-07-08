@@ -13,7 +13,7 @@ def main():
     """Inference demo for Real-ESRGAN.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--input', type=str, default=r'C:\Users\siani\PycharmProjects\AIxFootballAnalysis\output_images\yolo9c_dataset_v2_high_res2\no_gan\input\input_25.jpg', help='Input image or folder')
+    parser.add_argument('-i', '--input', type=str, default=r'C:\Users\siani\OneDrive\Desktop\Magistrale\ML4VMM\Project\YOLOSoccerDetection\dataset\yolov9\copy-paste-augmented\train\images\Screenshot-2025-01-03-113511_png.rf.f0116a752552cc0e8ca1d38b87f170fd.jpg', help='Input image or folder')
     parser.add_argument(
         '-n',
         '--model_name',
@@ -21,7 +21,7 @@ def main():
         default='realesr-general-x4v3',
         help=('Model names: RealESRGAN_x4plus | RealESRNet_x4plus | RealESRGAN_x4plus_anime_6B | RealESRGAN_x2plus | '
               'realesr-animevideov3 | realesr-general-x4v3'))
-    parser.add_argument('-o', '--output', type=str, default='src\models\esrgan', help='Output folder')
+    parser.add_argument('-o', '--output', type=str, default=r'code\models\esrgan\test_output', help='Output folder')
     parser.add_argument(
         '-dn',
         '--denoise_strength',
@@ -30,8 +30,8 @@ def main():
         help=('Denoise strength. 0 for weak denoise (keep noise), 1 for strong denoise ability. '
               'Only used for the realesr-general-x4v3 model'))
     parser.add_argument('-s', '--outscale', type=float, default=1, help='The final upsampling scale of the image')
-    parser.add_argument(
-        '--model_path', type=str, default=r'src\models\esrgan\experiments\finetune_Realesr-general-x4v3_2\models\net_g_latest.pth', help='[Option] Model path. Usually, you do not need to specify it')
+    parser.add_argument( 
+        '--model_path', type=str, default=r'code\models\esrgan\pretrained\realesr-general-wdn-x4v3.pth', help='[Option] Model path. Usually, you do not need to specify it')
     parser.add_argument('--suffix', type=str, default='out', help='Suffix of the restored image')
     parser.add_argument('-t', '--tile', type=int, default=0, help='Tile size, 0 for no tile during testing')
     parser.add_argument('--tile_pad', type=int, default=10, help='Tile padding')

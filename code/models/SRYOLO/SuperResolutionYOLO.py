@@ -4,6 +4,7 @@ import torch
 import os
 import yaml
 import glob
+import shutil
 from tqdm import tqdm
 
 # Environment settings and imports
@@ -15,7 +16,7 @@ from realesrgan import RealESRGANer
 
 
 # ==============================================================================
-# 1. DATASET CLASS WITH CACHING LOGIC
+# DATASET CLASS WITH CACHING LOGIC
 # ==============================================================================
 class CachedSRYOLODataset(Dataset):
     """
@@ -89,12 +90,11 @@ class CachedSRYOLODataset(Dataset):
 
 
 # ==============================================================================
-# 2. MODIFIED SRYOLO CLASS
+# SRYOLO CLASS
 # ==============================================================================
 class SRYOLO(YOLO):
     def __init__(self, yolo_weights, upscale=4, gan_weights=None, dni_weight=0.5,
                  tile=0, tile_pad=10, pre_pad=0):
-
         super().__init__(model=yolo_weights)
         self.yolo_weights_path = yolo_weights
         self._sr_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -130,55 +130,15 @@ class SRYOLO(YOLO):
             print(f"[SR ERROR] Error during Super-Resolution application: {e}")
             return img_np_rgb
 
-    def _create_dataset_cache(self, img_path, label_path, cache_name):
-        """Helper to create cache for a given split (train/val)."""
-        print(f"\n--- Checking cache for split in {img_path} ---")
-        cache_img_path = os.path.join(os.path.dirname(img_path), cache_name, "images")
-
-        num_orig_imgs = len(glob.glob(os.path.join(img_path, '*')))
-        num_cached_imgs = len(glob.glob(os.path.join(cache_img_path, '*.png')))
-
-        if num_cached_imgs == num_orig_imgs:
-            print("Cache found and complete. Training will use images from cache.")
-            return
-
-        print("Cache not found or incomplete. Starting creation...")
-        os.makedirs(cache_img_path, exist_ok=True)
-        cache_label_path = os.path.join(os.path.dirname(label_path), cache_name, "labels")
-        os.makedirs(cache_label_path, exist_ok=True)
-
-        original_image_files = sorted(glob.glob(os.path.join(img_path, '*')))
-        for img_file in tqdm(original_image_files, desc=f"Caching {cache_name}"):
-            base_filename = os.path.splitext(os.path.basename(img_file))[0]
-
-            img_np = cv2.imread(img_file)
-            img_np_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
-
-            sr_np_rgb = self.apply_sr_np(img_np_rgb)
-
-            # Save processed image
-            cv2.imwrite(os.path.join(cache_img_path, f"{base_filename}.png"),
-                        cv2.cvtColor(sr_np_rgb, cv2.COLOR_RGB2BGR))
-
-            # Copy label file
-            orig_label_file = os.path.join(label_path, f"{base_filename}.txt")
-            if os.path.exists(orig_label_file):
-                import shutil
-                shutil.copy(orig_label_file, cache_label_path)
-
     def train(self, **kwargs):
         """
-        Performs training after creating (if necessary) a pre-processed dataset
-        in a clean cache folder, with robust file search.
+        Performs training, forcing cache deletion and regeneration on each run.
         """
-        # 1. Read data.yaml file to get paths
         data_yaml_path = kwargs['data']
         with open(data_yaml_path, 'r') as f:
             data_config = yaml.safe_load(f)
 
-        # Base path of dataset, relative to .yaml file
         base_path = os.path.abspath(os.path.dirname(data_yaml_path))
-
         cached_data_config = data_config.copy()
         splits_to_cache = {'train', 'val'}
 
@@ -186,77 +146,56 @@ class SRYOLO(YOLO):
             if split not in data_config:
                 continue
 
-            # fixed discrepancy in 'val' split name
-            if split == 'val':
-                split = 'valid'
+            # Handle 'val' vs 'valid' directory names
+            split_in_fs = 'valid' if split == 'val' else split
+            original_img_dir = os.path.join(base_path, split_in_fs, 'images')
+            cache_dir = os.path.join(base_path, f"cache_{split_in_fs}")
 
-            original_img_dir = os.path.join(base_path, split, 'images')
-            cache_dir = os.path.join(base_path, f"cache_{split}")
+            # At the start of each training run, delete the cache if it exists.
+            if os.path.exists(cache_dir):
+                print(f"Found existing cache for '{split_in_fs}'. Deleting to force regeneration...")
+                shutil.rmtree(cache_dir)
+
             cached_img_dir = os.path.join(cache_dir, "images")
             cached_label_dir = os.path.join(cache_dir, "labels")
 
-            print(f"\n--- Checking cache for split '{split}' ---")
-
-            # DEBUG print to verify path
+            print(f"\n--- Checking cache for split '{split_in_fs}' ---")
             print(f"Looking for original images in: {original_img_dir}")
 
             image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp']
-            original_image_files = []
-            for ext in image_extensions:
-                original_image_files.extend(glob.glob(os.path.join(original_img_dir, ext)))
-
-            # Remove any duplicates and sort
-            original_image_files = sorted(list(set(original_image_files)))
+            original_image_files = sorted(list(set(
+                file for ext in image_extensions for file in glob.glob(os.path.join(original_img_dir, ext))
+            )))
             num_orig_imgs = len(original_image_files)
-
-            # Another DEBUG print
             print(f"Found {num_orig_imgs} original image files.")
 
             if num_orig_imgs == 0:
-                print(
-                    "WARNING: No image files found. Check that the path printed above is correct and contains images with valid extensions.")
-                continue  # Move to next split (e.g. 'val')
+                print(f"WARNING: No image files found for '{split_in_fs}'. Skipping this split.")
+                continue
 
-            num_cached_imgs = len(glob.glob(os.path.join(cached_img_dir, '*.png')))
+            print(f"Creating cache for '{split_in_fs}'...")
+            os.makedirs(cached_img_dir, exist_ok=True)
+            os.makedirs(cached_label_dir, exist_ok=True)
 
-            if num_cached_imgs != num_orig_imgs:
-                print(f"Cache for '{split}' not found or incomplete. Creating...")
-                os.makedirs(cached_img_dir, exist_ok=True)
-                os.makedirs(cached_label_dir, exist_ok=True)
-
-                original_label_dir = original_img_dir.replace('images', 'labels')
-
-                for img_file in tqdm(original_image_files, desc=f"Caching {split}"):
-                    base_filename = os.path.splitext(os.path.basename(img_file))[0]
-
-                    img_np = cv2.imread(img_file)
-                    img_np_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
-
-                    sr_np_rgb = self.apply_sr_np(img_np_rgb)
-
-                    cv2.imwrite(os.path.join(cached_img_dir, f"{base_filename}.png"),
-                                cv2.cvtColor(sr_np_rgb, cv2.COLOR_RGB2BGR))
-
-                    orig_label_file = os.path.join(original_label_dir, f"{base_filename}.txt")
-                    if os.path.exists(orig_label_file):
-                        import shutil
-                        shutil.copy(orig_label_file, cached_label_dir)
-            else:
-                print(f"Cache for '{split}' found and complete.")
-
-            # fixed discrepancy in 'val' split name
-            if split == 'valid':
-                split = 'val'
+            original_label_dir = original_img_dir.replace('images', 'labels')
+            for img_file in tqdm(original_image_files, desc=f"Caching {split_in_fs}"):
+                base_filename = os.path.splitext(os.path.basename(img_file))[0]
+                img_np = cv2.imread(img_file)
+                img_np_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+                sr_np_rgb = self.apply_sr_np(img_np_rgb)
+                cv2.imwrite(os.path.join(cached_img_dir, f"{base_filename}.png"),
+                            cv2.cvtColor(sr_np_rgb, cv2.COLOR_RGB2BGR))
+                orig_label_file = os.path.join(original_label_dir, f"{base_filename}.txt")
+                if os.path.exists(orig_label_file):
+                    shutil.copy(orig_label_file, cached_label_dir)
 
             cached_data_config[split] = os.path.relpath(cached_img_dir, base_path).replace('\\', '/')
 
-        # 3. Create new data.yaml file pointing to cache
         cached_yaml_path = os.path.join(base_path, 'cached_data.yaml')
         with open(cached_yaml_path, 'w') as f:
             yaml.dump(cached_data_config, f)
 
         print(f"\nTraining started using cached dataset specified in: {cached_yaml_path}")
-
         if self.sr_model:
             del self.sr_model
             self.sr_model = None
@@ -267,7 +206,91 @@ class SRYOLO(YOLO):
         kwargs['data'] = cached_yaml_path
         super().train(**kwargs)
 
-    def predict(self, source=None, **kwargs):
+    def val(self, **kwargs):
+        """
+        Runs validation on a specific split, creating a cache if it doesn't exist.
+        """
+        data_yaml_path = kwargs['data']
+        split_to_validate = kwargs.get('split', 'val')
+        print(f"\n--- Starting Validation with SR on split: '{split_to_validate}' ---")
+
+        with open(data_yaml_path, 'r') as f:
+            data_config = yaml.safe_load(f)
+
+        base_path = os.path.abspath(os.path.dirname(data_yaml_path))
+
+        # Determine the directory name for the split (e.g., 'test', 'valid')
+
+        split_in_fs = split_to_validate
+
+        original_img_dir = os.path.join(base_path, split_in_fs, 'images')
+        cache_dir = os.path.join(base_path, f"cache_{split_in_fs}")
+        cached_img_dir = os.path.join(cache_dir, "images")
+
+        if not os.path.exists(cached_img_dir):
+            print(f"Validation cache not found. Creating it now for '{split_in_fs}'...")
+            image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp']
+            original_image_files = sorted(list(set(
+                file for ext in image_extensions for file in glob.glob(os.path.join(original_img_dir, ext))
+            )))
+            if not original_image_files:
+                raise FileNotFoundError(f"No images found in {original_img_dir} for validation.")
+
+            cached_label_dir = os.path.join(cache_dir, "labels")
+            os.makedirs(cached_img_dir, exist_ok=True)
+            os.makedirs(cached_label_dir, exist_ok=True)
+            original_label_dir = original_img_dir.replace('images', 'labels')
+
+            for img_file in tqdm(original_image_files, desc=f"Caching {split_in_fs}"):
+                base_filename = os.path.splitext(os.path.basename(img_file))[0]
+                img_np = cv2.imread(img_file)
+                img_np_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+                sr_np_rgb = self.apply_sr_np(img_np_rgb)
+                cv2.imwrite(os.path.join(cached_img_dir, f"{base_filename}.png"),
+                            cv2.cvtColor(sr_np_rgb, cv2.COLOR_RGB2BGR))
+                orig_label_file = os.path.join(original_label_dir, f"{base_filename}.txt")
+                if os.path.exists(orig_label_file):
+                    shutil.copy(orig_label_file, cached_label_dir)
+        else:
+            print(f"Found cache for '{split_in_fs}'. Using it for validation.")
+
+        # Create a temporary yaml file for validation
+        val_data_config = {
+            'nc': data_config['nc'],
+            'names': data_config['names'],
+            split_to_validate: os.path.relpath(cached_img_dir, base_path).replace('\\', '/'),
+            #copy original other splits to ensure it runs 
+            'train': data_config.get('train', None),
+            'val': data_config.get('val', None),
+        }
+        cached_val_yaml_path = os.path.join(base_path, f'cached_{split_to_validate}_data.yaml')
+        with open(cached_val_yaml_path, 'w') as f:
+            yaml.dump(val_data_config, f)
+
+        print(f"\nValidation started using cached dataset specified in: {cached_val_yaml_path}")
+        kwargs['data'] = cached_val_yaml_path
+
+        return super().val(**kwargs)
+
+    def predict(self, source, **kwargs):
+        """
+        Applies Super-Resolution on-the-fly during inference.
+        """
+        if self.sr_model:
+            print("SR enabled for prediction. Applying on-the-fly...")
+
+            def on_predict_pre_process_start(predictor):
+                # predictor.ims is a list of images (NumPy arrays in BGR format)
+                for i in range(len(predictor.ims)):
+                    img_bgr = predictor.ims[i]
+                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                    sr_img_rgb = self.apply_sr_np(img_rgb)
+                    predictor.ims[i] = cv2.cvtColor(sr_img_rgb, cv2.COLOR_RGB2BGR)
+
+            self.add_callback("on_predict_pre_process_start", on_predict_pre_process_start)
+        else:
+            print("SR is not enabled for prediction.")
+
         return super().predict(source=source, **kwargs)
 
 

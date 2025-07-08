@@ -194,3 +194,11 @@ cython_debug/
 .cursorindexingignore
 
 dataset/*
+
+code/training/yolo_football_analysis/
+code/training/yolo_football_test/
+code/training/yolo11n.pt
+code/training/yolov5lu.pt
+code/training/yolov8l.pt
+code/training/yolov9c.pt
+
