@@ -292,37 +292,3 @@ class SRYOLO(YOLO):
             print("SR is not enabled for prediction.")
 
         return super().predict(source=source, **kwargs)
-
-
-# ==============================================================================
-# 3. USAGE EXAMPLE
-# ==============================================================================
-if __name__ == '__main__':
-    cwd = os.getcwd()
-    gan_weights = os.path.join(cwd, "..", "esrgan", "pretrained", "realesr-general-x4v3.pth")
-
-    # Create SRYOLO model with on-the-fly SR
-    sr_yolo = SRYOLO(
-        yolo_weights="yolov9c.pt",
-        upscale=4,
-        gan_weights=gan_weights,
-        dni_weight=0.5,
-        tile=0,
-        tile_pad=10,
-        pre_pad=0,
-    )
-    sr_yolo = sr_yolo.cuda()
-
-    # Training with on-the-fly SR
-    dataset_path = os.path.join(cwd, "..", "..", "..", "dataset", "yolov9", "v0")
-
-    # Method 1: Direct training (recommended)
-    sr_yolo.train(
-        data=os.path.join(dataset_path, "data.yaml"),
-        epochs=50,
-        imgsz=1280,
-        save=True,
-        project="yolo_football_analysis",
-        name="yoloSR_dataset_v3_high_res_onthefly",
-        batch=4
-    )
